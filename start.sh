@@ -1,20 +1,22 @@
 #! /bin/bash
 
 # Exit on error
-set -e
+set -Ee
+
+trap 'rc=$?; echo "ERROR: command failed at line ${LINENO}: ${BASH_COMMAND}"; echo "Network namespaces:"; ip netns ls || true; echo "Default namespace links:"; ip -brief link || true; if ip netns ls | grep -q "^physical"; then echo "Physical namespace links:"; ip -n physical -brief link || true; fi; exit "$rc"' ERR
 
 if [[ -n "$REVISION" ]]; then
   echo "Image revision: $REVISION"
 fi
 
 echo "Current public IP is:"
-curl --silent -w "\n" ipecho.net/plain
+curl --silent --max-time 15 -w "\n" ipecho.net/plain || echo "Public IP check failed before WireGuard setup"
 
 if ip netns ls | grep -q "physical"
 then
     # Dangling network from previous run, clean up
     echo "Clean up dangling network namespaces"
-    ip -all netns delete
+    ip -all netns delete || echo "Dangling namespace cleanup reported errors; continuing startup"
 fi
 
 # Grab information from the default interface set up in the container
@@ -95,16 +97,22 @@ ip route add default dev wg0
 # Wireguard interface is now set up and should be connected
 #
 echo "Wireguard is up - new IP:"
-curl --silent -w "\n" ipecho.net/plain
+curl --silent --max-time 15 -w "\n" ipecho.net/plain || echo "Public IP check failed after WireGuard setup; continuing startup"
+wg show || true
 
 # Create a veth link pair, one interface in each namespace
-ip link add veth1 type veth peer name veth2 netns physical
+echo "Creating veth pair for physical namespace proxying"
+ip link add veth1 type veth peer name veth2
+echo "Moving veth2 into physical namespace"
+ip link set veth2 netns physical
 
 # Set their IPs, CIDR with only two addresses to limit ip route ranges
+echo "Assigning veth addresses"
 ip addr add 10.10.13.36/31 dev veth1
 ip -n physical addr add 10.10.13.37/31 dev veth2
 
 # Start the veth interfaces
+echo "Starting veth interfaces"
 ip link set veth1 up
 ip -n physical link set veth2 up
 
@@ -120,10 +128,41 @@ if [[ "${WEBPROXY_ENABLED,,}" == "true" ]]; then
 
   # Start Privoxy in the current (wg0) namespace so traffic routes through WireGuard
   privoxy /etc/privoxy/config
+fi
 
-  # Activate the stream module and proxy stream block via nginx include dirs
+stream_proxy_ports=()
+if [[ "${WEBPROXY_ENABLED,,}" == "true" ]]; then
+  stream_proxy_ports+=("${WEBPROXY_PORT}")
+fi
+
+if [[ -n "${HOST_FORWARD_PORTS}" ]]; then
+  IFS=',' read -ra configured_ports <<< "${HOST_FORWARD_PORTS}"
+  for configured_port in "${configured_ports[@]}"; do
+    configured_port="$(echo "${configured_port}" | xargs)"
+    if [[ -n "${configured_port}" ]]; then
+      stream_proxy_ports+=("${configured_port}")
+    fi
+  done
+fi
+
+if [[ "${#stream_proxy_ports[@]}" -gt 0 ]]; then
+  # Activate the stream module and proxy configured TCP ports via nginx.
   cp /opt/nginx/templates/stream_module.conf /opt/nginx/main.d/stream_module.conf
-  envsubst '${WEBPROXY_PORT}' < /opt/nginx/templates/stream.conf > /opt/nginx/stream.d/stream.conf
+  {
+    echo "stream {"
+    for stream_proxy_port in $(printf '%s\n' "${stream_proxy_ports[@]}" | awk '!seen[$0]++'); do
+      if ! [[ "${stream_proxy_port}" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: Invalid HOST_FORWARD_PORTS value: ${stream_proxy_port}"
+        exit 1
+      fi
+
+      echo "  server {"
+      echo "    listen ${stream_proxy_port};"
+      echo "    proxy_pass 10.10.13.36:${stream_proxy_port};"
+      echo "  }"
+    done
+    echo "}"
+  } > /opt/nginx/stream.d/stream.conf
 fi
 
 # Start a reverse proxy in the physical namespace

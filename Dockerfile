@@ -45,6 +45,7 @@ RUN apt-get update && apt-get install -y \
 ADD start.sh /opt/wireguard/start.sh
 ADD get-config-value.py /opt/wireguard/get-config-value.py
 ADD strip-wg-config.py /opt/wireguard/strip-wg-config.py
+ADD pia-port-forwarding.sh /opt/wireguard/pia-port-forwarding.sh
 ADD nginx_server.conf /opt/nginx/server.conf
 ADD nginx_templates /opt/nginx/templates
 RUN mkdir -p /opt/nginx/main.d /opt/nginx/stream.d

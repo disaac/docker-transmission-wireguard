@@ -188,4 +188,9 @@ python3 /opt/transmission/updateSettings.py /opt/transmission/default-settings.j
 # Support running Transmission as non-root (and set permissions on folders)
 . /opt/transmission/userSetup.sh
 
+if [[ "${PIA_PORT_FORWARDING,,}" == "true" || "${PIA_PF,,}" == "true" ]]; then
+  echo "Starting PIA port forwarding helper"
+  bash /opt/wireguard/pia-port-forwarding.sh &
+fi
+
 exec su --preserve-environment ${RUN_AS} -s /bin/bash -c "/usr/bin/transmission-daemon --foreground -g ${TRANSMISSION_HOME}"

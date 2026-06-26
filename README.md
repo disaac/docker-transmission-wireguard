@@ -54,6 +54,28 @@ services:
         max-size: 10m
 ```
 
+## PIA port forwarding
+
+PIA port forwarding can be enabled when the mounted WireGuard config connects to a
+PIA region that supports forwarded ports.
+
+Set:
+
+```yaml
+environment:
+  - PIA_PORT_FORWARDING=true
+  - PIA_USERNAME=your-pia-username
+  - PIA_PASSWORD=your-pia-password
+```
+
+Alternatively, set `PIA_TOKEN` directly or mount credentials as
+`/config/pia-credentials.txt` with the username on line 1 and password on line 2.
+
+The helper infers the PIA port-forwarding gateway from `CONFIG_FILE`'s `Endpoint`.
+If needed, override it with `PIA_PF_GATEWAY`. The helper reserves a forwarded PIA
+port, updates Transmission's peer port through RPC, and refreshes the PIA binding
+every 15 minutes.
+
 ## DNS and WireGuard endpoints
 
 The container moves the Docker network interface into a separate network namespace so

@@ -75,3 +75,41 @@ The helper infers the PIA port-forwarding gateway from `CONFIG_FILE`'s `Endpoint
 If needed, override it with `PIA_PF_GATEWAY`. The helper reserves a forwarded PIA
 port, updates Transmission's peer port through RPC, and refreshes the PIA binding
 every 15 minutes.
+
+## Local network access
+
+By default the container's default route is forced through `wg0`. Set
+`LOCAL_NETWORK` only for private/local networks that must be reachable outside the
+VPN tunnel, for example a Docker bridge service or a LAN service:
+
+```yaml
+environment:
+  - LOCAL_NETWORK=172.22.0.8/32
+```
+
+Multiple networks can be comma-separated:
+
+```yaml
+environment:
+  - LOCAL_NETWORK=172.22.0.8/32,192.168.7.0/24
+```
+
+The route is added through the container's `physical` namespace veth gateway, while
+the default route remains on `wg0`. `LOCAL_NETWORK` accepts IPv4 private, loopback,
+or link-local CIDRs and rejects default routes and public networks.
+
+The internal veth pair defaults to `10.10.13.36/31` and `10.10.13.37/31`.
+Override `VETH_DEFAULT_NS_IP`, `VETH_PHYSICAL_NS_IP`, or `VETH_CIDR` only if
+that internal range conflicts with your environment.
+
+To narrow the non-VPN route to specific TCP ports, set `LOCAL_NETWORK_PORTS`:
+
+```yaml
+environment:
+  - LOCAL_NETWORK=172.22.0.8/32
+  - LOCAL_NETWORK_PORTS=8000
+```
+
+When `LOCAL_NETWORK_PORTS` is set, traffic to the configured local network over the
+non-VPN veth path is accepted only for those TCP destination ports and rejected for
+other ports.

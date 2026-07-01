@@ -33,7 +33,7 @@ COPY --from=transmissionui /opt/transmission-ui /opt/transmission-ui
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
     dumb-init python3 \
-    tzdata dnsutils iputils-ping ufw iproute2 \
+    tzdata dnsutils iputils-ping ufw iproute2 iptables \
     openssh-client git jq curl wget unrar unzip bc \
     # New for this image
     wireguard nginx libnginx-mod-stream privoxy gettext-base \

@@ -108,13 +108,135 @@ ip link set veth2 netns physical
 
 # Set their IPs, CIDR with only two addresses to limit ip route ranges
 echo "Assigning veth addresses"
-ip addr add 10.10.13.36/31 dev veth1
-ip -n physical addr add 10.10.13.37/31 dev veth2
+VETH_DEFAULT_NS_IP="${VETH_DEFAULT_NS_IP:-10.10.13.36}"
+VETH_PHYSICAL_NS_IP="${VETH_PHYSICAL_NS_IP:-10.10.13.37}"
+VETH_CIDR="${VETH_CIDR:-31}"
+export VETH_DEFAULT_NS_IP VETH_PHYSICAL_NS_IP VETH_CIDR
+ip addr add "${VETH_DEFAULT_NS_IP}/${VETH_CIDR}" dev veth1
+ip -n physical addr add "${VETH_PHYSICAL_NS_IP}/${VETH_CIDR}" dev veth2
 
 # Start the veth interfaces
 echo "Starting veth interfaces"
 ip link set veth1 up
 ip -n physical link set veth2 up
+
+configure_local_network_access() {
+  local local_networks="${LOCAL_NETWORK:-}"
+  local local_ports="${LOCAL_NETWORK_PORTS:-}"
+  local veth_dev="${LOCAL_NETWORK_DEV:-veth1}"
+  local veth_gateway="${LOCAL_NETWORK_GATEWAY:-${VETH_PHYSICAL_NS_IP}}"
+  local veth_source="${LOCAL_NETWORK_SOURCE:-${VETH_DEFAULT_NS_IP}}"
+  local physical_namespace="${LOCAL_NETWORK_NAMESPACE:-physical}"
+  local local_net
+  local local_port
+  local local_network_ports=()
+  local local_network_chain="LOCAL_NETWORK_OUT"
+  local allow_all_ports=true
+
+  if [[ -z "${local_networks}" ]]; then
+    return 0
+  fi
+
+  if [[ -n "${local_ports}" ]]; then
+    allow_all_ports=false
+    for local_port in ${local_ports//,/ }; do
+      local_port="$(echo "${local_port}" | xargs)"
+      if [[ -z "${local_port}" ]]; then
+        continue
+      fi
+
+      if ! [[ "${local_port}" =~ ^[0-9]+$ ]] || [[ "${local_port}" -lt 1 || "${local_port}" -gt 65535 ]]; then
+        echo "ERROR: Invalid LOCAL_NETWORK_PORTS value: ${local_port}"
+        exit 1
+      fi
+
+      local_network_ports+=("${local_port}")
+    done
+
+    if [[ "${#local_network_ports[@]}" -eq 0 ]]; then
+      echo "ERROR: LOCAL_NETWORK_PORTS was set but no valid ports were provided"
+      exit 1
+    fi
+
+    iptables -N "${local_network_chain}" 2>/dev/null || true
+    iptables -F "${local_network_chain}"
+    for local_port in "${local_network_ports[@]}"; do
+      iptables -A "${local_network_chain}" -p tcp --dport "${local_port}" -j ACCEPT
+    done
+    iptables -A "${local_network_chain}" -j REJECT
+  fi
+
+  ip netns exec "${physical_namespace}" sh -c 'echo 1 > /proc/sys/net/ipv4/ip_forward'
+
+  for local_net in ${local_networks//,/ }; do
+    local_net="$(echo "${local_net}" | xargs)"
+    if [[ -z "${local_net}" ]]; then
+      continue
+    fi
+
+    if ! python3 - "${local_net}" <<'PY'; then
+import ipaddress
+import sys
+
+try:
+    network = ipaddress.ip_network(sys.argv[1], strict=False)
+except ValueError as exc:
+    print(f"ERROR: Invalid LOCAL_NETWORK value '{sys.argv[1]}': {exc}", file=sys.stderr)
+    sys.exit(1)
+
+if network.prefixlen == 0:
+    print("ERROR: LOCAL_NETWORK must not be a default route", file=sys.stderr)
+    sys.exit(1)
+
+if network.version != 4:
+    print("ERROR: LOCAL_NETWORK currently supports IPv4 networks only", file=sys.stderr)
+    sys.exit(1)
+
+if not (network.is_private or network.is_loopback or network.is_link_local):
+    print(f"ERROR: LOCAL_NETWORK must be private, loopback, or link-local; got '{network}'", file=sys.stderr)
+    sys.exit(1)
+PY
+      exit 1
+    fi
+
+    echo "Adding route to local network ${local_net} via ${veth_gateway} dev ${veth_dev}"
+    ip route replace "${local_net}" via "${veth_gateway}" dev "${veth_dev}"
+
+    if [[ "${allow_all_ports}" == "true" ]]; then
+      iptables -C OUTPUT -o "${veth_dev}" -d "${local_net}" -j ACCEPT 2>/dev/null \
+        || iptables -I OUTPUT 1 -o "${veth_dev}" -d "${local_net}" -j ACCEPT
+
+      ip netns exec "${physical_namespace}" iptables -t nat -C POSTROUTING \
+        -s "${veth_source}/32" \
+        -d "${local_net}" \
+        -j MASQUERADE 2>/dev/null \
+        || ip netns exec "${physical_namespace}" iptables -t nat -A POSTROUTING \
+          -s "${veth_source}/32" \
+          -d "${local_net}" \
+          -j MASQUERADE
+    else
+      iptables -C OUTPUT -o "${veth_dev}" -d "${local_net}" -j "${local_network_chain}" 2>/dev/null \
+        || iptables -I OUTPUT 1 -o "${veth_dev}" -d "${local_net}" -j "${local_network_chain}"
+
+      for local_port in "${local_network_ports[@]}"; do
+        ip netns exec "${physical_namespace}" iptables -t nat -C POSTROUTING \
+          -s "${veth_source}/32" \
+          -d "${local_net}" \
+          -p tcp \
+          --dport "${local_port}" \
+          -j MASQUERADE 2>/dev/null \
+          || ip netns exec "${physical_namespace}" iptables -t nat -A POSTROUTING \
+            -s "${veth_source}/32" \
+            -d "${local_net}" \
+            -p tcp \
+            --dport "${local_port}" \
+            -j MASQUERADE
+      done
+    fi
+  done
+}
+
+configure_local_network_access
 
 if [[ "${WEBPROXY_ENABLED,,}" == "true" ]]; then
   WEBPROXY_PORT="${WEBPROXY_PORT:-8118}"
@@ -158,7 +280,7 @@ if [[ "${#stream_proxy_ports[@]}" -gt 0 ]]; then
 
       echo "  server {"
       echo "    listen ${stream_proxy_port};"
-      echo "    proxy_pass 10.10.13.36:${stream_proxy_port};"
+      echo "    proxy_pass ${VETH_DEFAULT_NS_IP}:${stream_proxy_port};"
       echo "  }"
     done
     echo "}"
@@ -166,7 +288,8 @@ if [[ "${#stream_proxy_ports[@]}" -gt 0 ]]; then
 fi
 
 # Start a reverse proxy in the physical namespace
-ip netns exec physical nginx -c /opt/nginx/server.conf
+envsubst '${VETH_DEFAULT_NS_IP}' < /opt/nginx/server.conf > /opt/nginx/server.generated.conf
+ip netns exec physical nginx -c /opt/nginx/server.generated.conf
 
 # Set TRANSMISSION_WEB_HOME if user has selected an alternative web UI
 if [[ -n "$TRANSMISSION_WEB_UI" ]]; then

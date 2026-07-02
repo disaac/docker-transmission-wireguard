@@ -32,6 +32,9 @@ echo "Gateway: $GW"
 echo "Interface address: $INT_IP"
 echo "Interface broadcast: $INT_BRD"
 
+DOCKER_DNS_SERVER="${DOCKER_DNS_SERVER:-$(awk '/^nameserver[[:space:]]+127\.0\.0\.11$/ { print $2; exit }' /etc/resolv.conf)}"
+DOCKER_DNS_SERVER="${DOCKER_DNS_SERVER:-127.0.0.11}"
+
 # Resolve WireGuard Endpoint hostnames to IPs while eth0 is still in this namespace
 # (uses dig @WG_BOOTSTRAP_DNS, default 1.1.1.1 — not Docker's 127.0.0.11).
 RESOLVED_CONFIG="$(mktemp)"
@@ -93,6 +96,164 @@ ip link set wg0 up
 #ip link set lo up
 ip route add default dev wg0
 
+configure_split_dns() {
+  local docker_dns_names="${DOCKER_DNS_NAMES:-}"
+  local vpn_dns_servers="${VPN_DNS_SERVERS:-1.1.1.1,1.0.0.1}"
+  local split_dns_listen_ip="${SPLIT_DNS_LISTEN_IP:-${VETH_DEFAULT_NS_IP:-127.0.0.1}}"
+  local configured_docker_dns_forwarder_ip="${DOCKER_DNS_FORWARDER_IP:-}"
+  local docker_dns_forwarder_ip="${configured_docker_dns_forwarder_ip:-${VETH_PHYSICAL_NS_IP:-}}"
+  local docker_dns_forwarder_port="${DOCKER_DNS_FORWARDER_PORT:-5353}"
+  local start_docker_dns_forwarder="${START_DOCKER_DNS_FORWARDER:-}"
+  local split_dns_config="/tmp/dnsmasq-split-dns.conf"
+  local docker_dns_config="/tmp/dnsmasq-docker-dns.conf"
+  local docker_dns_name
+  local vpn_dns_server
+
+  if [[ -z "${docker_dns_names}" ]]; then
+    return 0
+  fi
+
+  command -v dnsmasq >/dev/null 2>&1 || {
+    echo "ERROR: DOCKER_DNS_NAMES requires dnsmasq"
+    exit 1
+  }
+
+  if [[ -z "${docker_dns_forwarder_ip}" ]]; then
+    echo "ERROR: DOCKER_DNS_NAMES requires VETH_PHYSICAL_NS_IP or DOCKER_DNS_FORWARDER_IP"
+    exit 1
+  fi
+
+  if ! [[ "${docker_dns_forwarder_port}" =~ ^[0-9]+$ ]] || [[ "${docker_dns_forwarder_port}" -lt 1 || "${docker_dns_forwarder_port}" -gt 65535 ]]; then
+    echo "ERROR: Invalid DOCKER_DNS_FORWARDER_PORT value: ${docker_dns_forwarder_port}"
+    exit 1
+  fi
+
+  if [[ -z "${start_docker_dns_forwarder}" ]]; then
+    if [[ -n "${configured_docker_dns_forwarder_ip}" ]]; then
+      start_docker_dns_forwarder="false"
+    else
+      start_docker_dns_forwarder="true"
+    fi
+  fi
+
+  if [[ "${start_docker_dns_forwarder,,}" == "true" ]]; then
+    {
+      echo "no-resolv"
+      echo "bind-interfaces"
+      echo "listen-address=${docker_dns_forwarder_ip}"
+      echo "port=${docker_dns_forwarder_port}"
+      echo "cache-size=0"
+      echo "pid-file=/tmp/dnsmasq-docker-dns.pid"
+      for docker_dns_name in ${docker_dns_names//,/ }; do
+        docker_dns_name="$(echo "${docker_dns_name}" | xargs)"
+        if [[ -n "${docker_dns_name}" ]]; then
+          echo "server=/${docker_dns_name}/${DOCKER_DNS_SERVER}"
+        fi
+      done
+    } > "${docker_dns_config}"
+
+    echo "Starting Docker DNS forwarder on ${docker_dns_forwarder_ip}:${docker_dns_forwarder_port} for [${docker_dns_names}] via ${DOCKER_DNS_SERVER}"
+    ip netns exec physical dnsmasq --conf-file="${docker_dns_config}"
+  else
+    echo "Using external Docker DNS forwarder at ${docker_dns_forwarder_ip}:${docker_dns_forwarder_port} for [${docker_dns_names}]"
+  fi
+
+  {
+    echo "no-resolv"
+    echo "bind-interfaces"
+    echo "listen-address=127.0.0.1"
+    echo "listen-address=${split_dns_listen_ip}"
+    echo "port=53"
+    echo "cache-size=0"
+    echo "pid-file=/tmp/dnsmasq-split-dns.pid"
+    for vpn_dns_server in ${vpn_dns_servers//,/ }; do
+      vpn_dns_server="$(echo "${vpn_dns_server}" | xargs)"
+      if [[ -n "${vpn_dns_server}" ]]; then
+        echo "server=${vpn_dns_server}"
+      fi
+    done
+    for docker_dns_name in ${docker_dns_names//,/ }; do
+      docker_dns_name="$(echo "${docker_dns_name}" | xargs)"
+      if [[ -n "${docker_dns_name}" ]]; then
+        echo "server=/${docker_dns_name}/${docker_dns_forwarder_ip}#${docker_dns_forwarder_port}"
+      fi
+    done
+  } > "${split_dns_config}"
+
+  echo "Starting split DNS on ${split_dns_listen_ip}. Docker names [${docker_dns_names}] resolve via ${docker_dns_forwarder_ip}:${docker_dns_forwarder_port}; other DNS uses [${vpn_dns_servers}]"
+  dnsmasq --conf-file="${split_dns_config}"
+  {
+    echo "nameserver ${split_dns_listen_ip}"
+    echo "options ndots:0"
+  } > /etc/resolv.conf
+}
+
+configure_docker_name_proxies() {
+  local proxy_targets="${DOCKER_NAME_PROXY_TARGETS:-}"
+  local proxy_resolver="${DOCKER_NAME_PROXY_RESOLVER:-127.0.0.1}"
+  local proxy_config="/tmp/nginx-docker-name-proxy.conf"
+  local proxy_target
+  local proxy_name
+  local target_port
+  local listen_port
+
+  if [[ -z "${proxy_targets}" ]]; then
+    return 0
+  fi
+
+  command -v nginx >/dev/null 2>&1 || {
+    echo "ERROR: DOCKER_NAME_PROXY_TARGETS requires nginx"
+    exit 1
+  }
+
+  {
+    echo "pid /tmp/nginx-docker-name-proxy.pid;"
+    echo "events { worker_connections 256; }"
+    echo "http {"
+    echo "  resolver ${proxy_resolver} valid=10s ipv6=off;"
+    for proxy_target in ${proxy_targets//,/ }; do
+      proxy_target="$(echo "${proxy_target}" | xargs)"
+      if [[ -z "${proxy_target}" ]]; then
+        continue
+      fi
+
+      IFS=':' read -r proxy_name target_port listen_port <<< "${proxy_target}"
+      if [[ -z "${proxy_name}" || -z "${target_port}" || -z "${listen_port}" ]]; then
+        echo "ERROR: Invalid DOCKER_NAME_PROXY_TARGETS value '${proxy_target}'. Expected name:target_port:listen_port"
+        exit 1
+      fi
+
+      if ! [[ "${target_port}" =~ ^[0-9]+$ ]] || [[ "${target_port}" -lt 1 || "${target_port}" -gt 65535 ]]; then
+        echo "ERROR: Invalid target port in DOCKER_NAME_PROXY_TARGETS value: ${proxy_target}"
+        exit 1
+      fi
+
+      if ! [[ "${listen_port}" =~ ^[0-9]+$ ]] || [[ "${listen_port}" -lt 1 || "${listen_port}" -gt 65535 ]]; then
+        echo "ERROR: Invalid listen port in DOCKER_NAME_PROXY_TARGETS value: ${proxy_target}"
+        exit 1
+      fi
+
+      echo "  server {"
+      echo "    listen 127.0.0.1:${listen_port};"
+      echo "    set \$docker_name_upstream ${proxy_name}:${target_port};"
+      echo "    location / {"
+      echo "      proxy_pass http://\$docker_name_upstream;"
+      echo "      proxy_set_header Host ${proxy_name};"
+      echo "      proxy_set_header X-Real-IP \$remote_addr;"
+      echo "      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;"
+      echo "      proxy_set_header X-Forwarded-Proto \$scheme;"
+      echo "      proxy_http_version 1.1;"
+      echo "      proxy_set_header Connection \"\";"
+      echo "    }"
+      echo "  }"
+    done
+    echo "}"
+  } > "${proxy_config}"
+
+  echo "Starting Docker-name proxy for [${proxy_targets}] using resolver ${proxy_resolver}"
+  nginx -c "${proxy_config}"
+}
+
 #
 # Wireguard interface is now set up and should be connected
 #
@@ -119,6 +280,10 @@ ip -n physical addr add "${VETH_PHYSICAL_NS_IP}/${VETH_CIDR}" dev veth2
 echo "Starting veth interfaces"
 ip link set veth1 up
 ip -n physical link set veth2 up
+ip -n physical link set lo up
+
+configure_split_dns
+configure_docker_name_proxies
 
 configure_local_network_access() {
   local local_networks="${LOCAL_NETWORK:-}"

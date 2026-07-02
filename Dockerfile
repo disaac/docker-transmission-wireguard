@@ -31,7 +31,7 @@ COPY --from=transmissionui /opt/transmission-ui /opt/transmission-ui
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
-    dumb-init transmission-daemon python3 \
+    dumb-init transmission-daemon python3 dnsmasq-base \
     tzdata dnsutils iputils-ping ufw iproute2 iptables \
     openssh-client git jq curl wget unrar unzip bc \
     # New for this image

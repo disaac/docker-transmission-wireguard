@@ -113,3 +113,95 @@ environment:
 When `LOCAL_NETWORK_PORTS` is set, traffic to the configured local network over the
 non-VPN veth path is accepted only for those TCP destination ports and rejected for
 other ports.
+
+## Docker service name resolution
+
+The container normally writes VPN-routed public DNS servers to `/etc/resolv.conf`.
+That protects general DNS lookups from using Docker or host DNS, but it also means
+Docker network aliases such as `apprise` will not resolve.
+
+Set `DOCKER_DNS_NAMES` for Docker-local names that should resolve through Docker's
+embedded DNS while all other DNS continues to use VPN-routed DNS servers:
+
+```yaml
+environment:
+  - DOCKER_DNS_NAMES=apprise
+```
+
+Multiple names can be comma-separated:
+
+```yaml
+environment:
+  - DOCKER_DNS_NAMES=apprise,traefik
+```
+
+This starts a local split-DNS `dnsmasq` instance in the WireGuard namespace:
+
+- configured Docker names resolve via Docker DNS at `127.0.0.11`
+- all other DNS resolves through `VPN_DNS_SERVERS`, defaulting to `1.1.1.1,1.0.0.1`
+- `/etc/resolv.conf` points to the WireGuard namespace split-DNS listener
+
+Services that share this container's network namespace cannot set Docker `dns:`
+options. For those services, bind-mount a resolver file that points at the
+WireGuard namespace split-DNS listener:
+
+```yaml
+services:
+  transmission-wireguard:
+    environment:
+      - DOCKER_DNS_NAMES=apprise
+
+  sidecar:
+    network_mode: service:transmission-wireguard
+    volumes:
+      - ./transmission-resolv.conf:/etc/resolv.conf:ro
+```
+
+`transmission-resolv.conf` should match the split-DNS listener address. With the
+default veth settings:
+
+```text
+nameserver 10.10.13.36
+options ndots:0
+```
+
+The image starts one dnsmasq instance in the WireGuard namespace and one Docker DNS
+forwarder in the physical Docker namespace. The physical forwarder has no generic
+upstream and forwards only names listed in `DOCKER_DNS_NAMES`; normal lookups stay
+on the VPN default route. This lets sidecars use names like `http://apprise:8000`
+without hard-coded container IPs.
+
+If Docker's embedded DNS at `127.0.0.11` is not reachable from the physical
+namespace in your environment, run a dedicated DNS forwarder on the Docker network
+instead and point split DNS at it:
+
+```yaml
+services:
+  docker-dns:
+    build:
+      context: ./coredns-docker
+    image: local-coredns:latest
+    command: ["-conf", "/Corefile"]
+    networks:
+      trafik:
+        ipv4_address: 172.22.0.53
+
+  transmission-wireguard:
+    environment:
+      - DOCKER_DNS_NAMES=apprise
+      - DOCKER_DNS_FORWARDER_IP=172.22.0.53
+      - DOCKER_DNS_FORWARDER_PORT=53
+```
+
+Use a small Dockerfile for the DNS forwarder image so the Corefile is readable by
+CoreDNS' non-root runtime user without relying on bind/config mount permissions:
+
+```dockerfile
+FROM coredns/coredns:latest
+
+COPY --chown=nonroot:nonroot --chmod=0444 Corefile /Corefile
+```
+
+When `DOCKER_DNS_FORWARDER_IP` is set, the image treats it as an external upstream
+and does not start the internal physical-namespace Docker DNS forwarder unless
+`START_DOCKER_DNS_FORWARDER=true` is also set.

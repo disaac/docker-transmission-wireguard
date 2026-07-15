@@ -47,8 +47,9 @@ endpoint_host_from_config() {
   local endpoint
   endpoint="$(python3 /opt/wireguard/get-config-value.py Endpoint "$CONFIG_FILE")"
   endpoint="${endpoint%%,*}"
-
-  if [[ "$endpoint" =~ ^\[([^]]+)\]:(.+)$ ]]; then
+  local endpoint_re
+  endpoint_re='^\[([^]]+)\]:(.+)$'
+  if [[ "$endpoint" =~ $endpoint_re ]]; then
     echo "${BASH_REMATCH[1]}"
     return
   fi

@@ -1,0 +1,10 @@
+[tools]
+typos = "latest"
+taplo = "latest"
+prek = "latest"
+shellcheck = "latest"
+shfmt = "latest"
+hadolint = "latest"
+actionlint = "latest"
+[settings]
+cargo.binstall = true

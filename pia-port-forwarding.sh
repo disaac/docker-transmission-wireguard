@@ -6,6 +6,13 @@ log() {
   echo "[pia-port-forwarding] $*"
 }
 
+run_port_forwarding_cycle() {
+  get_pia_token || return 1
+  get_signature || return 1
+  bind_port || return 1
+  update_transmission_port || return 1
+}
+
 setting_value() {
   local setting="$1"
   jq -r --arg setting "$setting" '.[$setting] // empty' "$transmission_settings_file"
@@ -61,7 +68,7 @@ get_pia_token() {
 
   if [[ -z "$username" || -z "$password" ]]; then
     log "PIA credentials are required. Set PIA_TOKEN, PIA_USERNAME/PIA_PASSWORD, or mount /config/pia-credentials.txt."
-    exit 1
+    return 1
   fi
 
   log "Requesting PIA auth token"
@@ -69,13 +76,18 @@ get_pia_token() {
     --request POST \
     --max-time "$curl_max_time" \
     --user "$username:$password" \
-    "https://www.privateinternetaccess.com/gtoken/generateToken")"
+    "https://www.privateinternetaccess.com/gtoken/generateToken")" || return 1
 
-  pia_token="$(echo "$response" | jq -er '.token')"
+  pia_token="$(echo "$response" | jq -er '.token')" || return 1
 }
 
 get_signature() {
   local response decoded_payload
+
+  if [[ -z "${pia_token:-}" ]]; then
+    log "PIA token is not available yet"
+    return 1
+  fi
 
   log "Requesting forwarded port signature from ${pf_gateway}"
   response="$(curl --insecure --get --silent --show-error --fail \
@@ -83,18 +95,18 @@ get_signature() {
     --retry-delay "$curl_retry_delay" \
     --max-time "$curl_max_time" \
     --data-urlencode "token=${pia_token}" \
-    "https://${pf_gateway}:19999/getSignature")"
+    "https://${pf_gateway}:19999/getSignature")" || return 1
 
   if [[ "$(echo "$response" | jq -r '.status')" != "OK" ]]; then
     log "PIA getSignature returned an error: $response"
-    exit 1
+    return 1
   fi
 
-  pf_payload="$(echo "$response" | jq -er '.payload')"
-  pf_signature="$(echo "$response" | jq -er '.signature')"
-  decoded_payload="$(echo "$pf_payload" | base64 -d)"
-  pf_port="$(echo "$decoded_payload" | jq -er '.port')"
-  pf_expires_at="$(echo "$decoded_payload" | jq -er '.expires_at')"
+  pf_payload="$(echo "$response" | jq -er '.payload')" || return 1
+  pf_signature="$(echo "$response" | jq -er '.signature')" || return 1
+  decoded_payload="$(echo "$pf_payload" | base64 -d)" || return 1
+  pf_port="$(echo "$decoded_payload" | jq -er '.port')" || return 1
+  pf_expires_at="$(echo "$decoded_payload" | jq -er '.expires_at')" || return 1
 
   if ! pf_expires_epoch="$(date -d "$pf_expires_at" +%s 2>/dev/null)"; then
     log "Could not parse PIA port expiration date: ${pf_expires_at}"
@@ -105,17 +117,22 @@ get_signature() {
 bind_port() {
   local response
 
+  if [[ -z "${pf_payload:-}" || -z "${pf_signature:-}" ]]; then
+    log "PIA port forwarding payload/signature is not available yet"
+    return 1
+  fi
+
   response="$(curl --insecure --get --silent --show-error --fail \
     --retry "$curl_retry" \
     --retry-delay "$curl_retry_delay" \
     --max-time "$curl_max_time" \
     --data-urlencode "payload=${pf_payload}" \
     --data-urlencode "signature=${pf_signature}" \
-    "https://${pf_gateway}:19999/bindPort")"
+    "https://${pf_gateway}:19999/bindPort")" || return 1
 
   if [[ "$(echo "$response" | jq -r '.status')" != "OK" ]]; then
     log "PIA bindPort returned an error: $response"
-    exit 1
+    return 1
   fi
 
   log "Bound forwarded port ${pf_port}; expires at ${pf_expires_at}"
@@ -158,6 +175,11 @@ wait_for_transmission() {
 update_transmission_port() {
   local current_port
 
+  if [[ -z "${pf_port:-}" ]]; then
+    log "PIA forwarded port is not available yet"
+    return 1
+  fi
+
   wait_for_transmission
 
   current_port="$(transmission-remote "$transmission_rpc_host" "${transmission_remote_auth_args[@]}" -si \
@@ -188,18 +210,18 @@ fi
 
 if [[ -z "$pf_gateway" ]]; then
   log "Could not determine PIA port forwarding gateway. Set PIA_PF_GATEWAY or ensure CONFIG_FILE has Endpoint."
-  exit 1
+  exit 0
 fi
 
 if [[ ! -f "$transmission_settings_file" ]]; then
   log "Transmission settings file does not exist: ${transmission_settings_file}"
-  exit 1
+  exit 0
 fi
 
-get_pia_token
-get_signature
-bind_port
-update_transmission_port
+until run_port_forwarding_cycle; do
+  log "PIA port forwarding setup failed; retrying in ${refresh_seconds}s"
+  sleep "$refresh_seconds"
+done
 
 while true; do
   sleep "$refresh_seconds"
@@ -209,12 +231,9 @@ while true; do
 
   if [[ "$pf_expires_epoch" -eq 0 || "$remaining_seconds" -lt "$renew_before_seconds" ]]; then
     log "Forwarded port reservation is nearing expiration; requesting a new reservation"
-    get_pia_token
-    get_signature
-    bind_port
-    update_transmission_port
+    run_port_forwarding_cycle || log "PIA port forwarding renewal failed; will retry on next refresh"
     continue
   fi
 
-  bind_port
+  bind_port || log "PIA port forwarding bind refresh failed; will retry on next refresh"
 done

@@ -3,7 +3,22 @@
 # Exit on error
 set -Ee
 
-trap 'rc=$?; echo "ERROR: command failed at line ${LINENO}: ${BASH_COMMAND}"; echo "Network namespaces:"; ip netns ls || true; echo "Default namespace links:"; ip -brief link || true; if ip netns ls | grep -q "^physical"; then echo "Physical namespace links:"; ip -n physical -brief link || true; fi; exit "$rc"' ERR
+error_report() {
+  local rc=$?
+
+  echo "ERROR: command failed at line ${LINENO}: ${BASH_COMMAND}"
+  echo "Network namespaces:"
+  ip netns ls || true
+  echo "Default namespace links:"
+  ip -brief link || true
+  if ip netns ls | grep -q "^physical"; then
+    echo "Physical namespace links:"
+    ip -n physical -brief link || true
+  fi
+  exit "$rc"
+}
+
+trap error_report ERR
 
 if [[ -n "$REVISION" ]]; then
   echo "Image revision: $REVISION"
@@ -52,6 +67,122 @@ fi
 
 echo "DNS config:"
 cat /etc/resolv.conf
+
+truthy() {
+  case "${1,,}" in
+    true|1|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+piawgc_log() {
+  echo "[piawgc] $*"
+}
+
+require_positive_integer() {
+  local name="$1"
+  local value="$2"
+
+  if ! [[ "${value}" =~ ^[0-9]+$ ]] || [[ "${value}" -lt 1 ]]; then
+    echo "ERROR: ${name} must be a positive integer; got '${value}'"
+    exit 1
+  fi
+}
+
+configure_piawgc_environment() {
+  if ! truthy "${PIA_USE_PIAWGC:-}"; then
+    return 0
+  fi
+
+  command -v piawgc >/dev/null 2>&1 || {
+    echo "ERROR: PIA_USE_PIAWGC is enabled, but piawgc is not installed in the image"
+    exit 1
+  }
+
+  if [[ -z "${CONFIG_FILE:-}" ]]; then
+    echo "ERROR: PIA_USE_PIAWGC requires CONFIG_FILE to point at the WireGuard config to generate"
+    exit 1
+  fi
+
+  if [[ -z "${PIAWGC_REGION:-}" && "${PIAWGC_DEDICATED_IP,,}" != "true" ]]; then
+    echo "ERROR: PIA_USE_PIAWGC requires PIAWGC_REGION to be set to the PIA region id, for example 'swiss' or 'nl_amsterdam'"
+    exit 1
+  fi
+
+  if [[ -z "${PIAWGC_PIA_TOKEN:-}" && -n "${PIA_TOKEN:-}" ]]; then
+    export PIAWGC_PIA_TOKEN="${PIA_TOKEN}"
+  fi
+
+  if [[ -z "${PIAWGC_PIA_USERNAME:-}" ]]; then
+    export PIAWGC_PIA_USERNAME="${PIA_USERNAME:-${PIA_USER:-${OPENVPN_USERNAME:-}}}"
+  fi
+
+  if [[ -z "${PIAWGC_PIA_PASSWORD:-}" ]]; then
+    export PIAWGC_PIA_PASSWORD="${PIA_PASSWORD:-${PIA_PASS:-${OPENVPN_PASSWORD:-}}}"
+  fi
+
+  if [[ -z "${PIAWGC_PIA_TOKEN:-}" && ( -z "${PIAWGC_PIA_USERNAME:-}" || -z "${PIAWGC_PIA_PASSWORD:-}" ) ]]; then
+    echo "ERROR: PIA_USE_PIAWGC requires PIA credentials. Set PIAWGC_PIA_TOKEN, PIAWGC_PIA_USERNAME/PIAWGC_PIA_PASSWORD, or PIA_USERNAME/PIA_PASSWORD."
+    exit 1
+  fi
+
+  PIAWGC_WG_INTERFACE="${PIAWGC_WG_INTERFACE:-wg0}"
+  PIAWGC_WG_MONITOR_HEALTH_CHECK_INTERVAL_MS="${PIAWGC_WG_MONITOR_HEALTH_CHECK_INTERVAL_MS:-30000}"
+  PIAWGC_WG_MONITOR_FAILED_HEALTH_CHECKS="${PIAWGC_WG_MONITOR_FAILED_HEALTH_CHECKS:-3}"
+  PIAWGC_WG_MONITOR_RECOVERY_ATTEMPTS="${PIAWGC_WG_MONITOR_RECOVERY_ATTEMPTS:-5}"
+  PIAWGC_PIA_STATUS_FILE="${PIAWGC_PIA_STATUS_FILE:-/tmp/piawgc-status.json}"
+  PIAWGC_PID_FILE="${PIAWGC_PID_FILE:-/tmp/piawgc.pid}"
+  PIAWGC_STATUS_WAIT_SECONDS="${PIAWGC_STATUS_WAIT_SECONDS:-10}"
+  export PIAWGC_WG_INTERFACE PIAWGC_WG_MONITOR_HEALTH_CHECK_INTERVAL_MS
+  export PIAWGC_WG_MONITOR_FAILED_HEALTH_CHECKS PIAWGC_WG_MONITOR_RECOVERY_ATTEMPTS
+  export PIAWGC_PIA_STATUS_FILE PIAWGC_PID_FILE PIAWGC_STATUS_WAIT_SECONDS
+
+  require_positive_integer PIAWGC_WG_MONITOR_HEALTH_CHECK_INTERVAL_MS "${PIAWGC_WG_MONITOR_HEALTH_CHECK_INTERVAL_MS}"
+  require_positive_integer PIAWGC_WG_MONITOR_FAILED_HEALTH_CHECKS "${PIAWGC_WG_MONITOR_FAILED_HEALTH_CHECKS}"
+  require_positive_integer PIAWGC_WG_MONITOR_RECOVERY_ATTEMPTS "${PIAWGC_WG_MONITOR_RECOVERY_ATTEMPTS}"
+  require_positive_integer PIAWGC_STATUS_WAIT_SECONDS "${PIAWGC_STATUS_WAIT_SECONDS}"
+
+  rm -f "${PIAWGC_PIA_STATUS_FILE}" "${PIAWGC_PID_FILE}"
+}
+
+piawgc_generate_initial_config() {
+  if ! truthy "${PIA_USE_PIAWGC:-}"; then
+    return 0
+  fi
+
+  piawgc_log "Generating ${CONFIG_FILE} before WireGuard setup using PIAWGC_REGION=${PIAWGC_REGION:-dedicated-ip}"
+  mkdir -p "$(dirname "${CONFIG_FILE}")"
+  PIAWGC_LISTEN_SIG=false \
+    PIAWGC_LISTEN_TCP=false \
+    PIAWGC_NO_WG_RESTART=true \
+    piawgc --outfile "${CONFIG_FILE}" --no-wg-restart
+}
+
+start_piawgc_daemon() {
+  if ! truthy "${PIA_USE_PIAWGC:-}"; then
+    return 0
+  fi
+
+  piawgc_log "Starting signal daemon and WireGuard monitor for ${CONFIG_FILE}"
+  PIAWGC_LISTEN_SIG=true \
+    PIAWGC_LISTEN_TCP=false \
+    PIAWGC_NO_WG_RESTART=false \
+    piawgc --listen-sig --outfile "${CONFIG_FILE}" &
+  PIAWGC_PID=$!
+  export PIAWGC_PID
+  printf '%s\n' "${PIAWGC_PID}" > "${PIAWGC_PID_FILE}"
+
+  sleep 1
+  if ! kill -0 "${PIAWGC_PID}" 2>/dev/null; then
+    echo "ERROR: piawgc signal daemon failed to start"
+    exit 1
+  fi
+
+  piawgc_log "Started signal daemon with PID ${PIAWGC_PID}"
+}
+
+configure_piawgc_environment
+piawgc_generate_initial_config
 
 # Create a "physical" network namespace and move our eth0 there
 ip netns ls
@@ -254,12 +385,55 @@ configure_docker_name_proxies() {
   nginx -c "${proxy_config}"
 }
 
+wireguard_endpoint_host() {
+  local endpoint="$1"
+
+  if [[ "$endpoint" =~ ^\[([^]]+)\]:(.+)$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return
+  fi
+
+  echo "${endpoint%:*}"
+}
+
+debug_wireguard_routing() {
+  local endpoint
+  local endpoint_host
+
+  if [[ "${WIREGUARD_DEBUG,,}" != "true" ]]; then
+    return 0
+  fi
+
+  endpoint="$(python3 /opt/wireguard/get-config-value.py Endpoint "$CONFIG_FILE" | cut -d, -f1 | xargs)"
+  endpoint_host="$(wireguard_endpoint_host "${endpoint}")"
+
+  echo "WireGuard debug: config endpoint is ${endpoint}"
+  echo "WireGuard debug: wg0 address"
+  ip -brief addr show dev wg0 || true
+  echo "WireGuard debug: wg0 link counters"
+  ip -s link show dev wg0 || true
+  echo "WireGuard debug: latest handshakes"
+  wg show wg0 latest-handshakes || true
+  echo "WireGuard debug: default namespace route to endpoint"
+  ip route get "${endpoint_host}" || true
+  echo "WireGuard debug: physical namespace links"
+  ip -n physical -brief addr || true
+  echo "WireGuard debug: physical namespace routes"
+  ip -n physical route || true
+  echo "WireGuard debug: physical namespace route to endpoint"
+  ip -n physical route get "${endpoint_host}" || true
+  echo "WireGuard debug: physical namespace UDP sockets"
+  ip netns exec physical ss -H -u -a -n || true
+}
+
 #
 # Wireguard interface is now set up and should be connected
 #
 echo "Wireguard is up - new IP:"
 curl --silent --max-time 15 -w "\n" ipecho.net/plain || echo "Public IP check failed after WireGuard setup; continuing startup"
 wg show || true
+debug_wireguard_routing
+start_piawgc_daemon
 
 # Create a veth link pair, one interface in each namespace
 echo "Creating veth pair for physical namespace proxying"
@@ -453,7 +627,7 @@ if [[ "${#stream_proxy_ports[@]}" -gt 0 ]]; then
 fi
 
 # Start a reverse proxy in the physical namespace
-envsubst '${VETH_DEFAULT_NS_IP}' < /opt/nginx/server.conf > /opt/nginx/server.generated.conf
+envsubst "\${VETH_DEFAULT_NS_IP}" < /opt/nginx/server.conf > /opt/nginx/server.generated.conf
 ip netns exec physical nginx -c /opt/nginx/server.generated.conf
 
 # Set TRANSMISSION_WEB_HOME if user has selected an alternative web UI
@@ -478,9 +652,10 @@ fi
 
 # Make sure TRANSMISSION_HOME exists and create/update settings.json
 mkdir -p "$TRANSMISSION_HOME"
-python3 /opt/transmission/updateSettings.py /opt/transmission/default-settings.json ${TRANSMISSION_HOME}/settings.json || exit 1
+python3 /opt/transmission/updateSettings.py /opt/transmission/default-settings.json "${TRANSMISSION_HOME}/settings.json" || exit 1
 
 # Support running Transmission as non-root (and set permissions on folders)
+# shellcheck source=/dev/null
 . /opt/transmission/userSetup.sh
 
 if [[ "${PIA_PORT_FORWARDING,,}" == "true" || "${PIA_PF,,}" == "true" ]]; then
@@ -488,4 +663,4 @@ if [[ "${PIA_PORT_FORWARDING,,}" == "true" || "${PIA_PF,,}" == "true" ]]; then
   bash /opt/wireguard/pia-port-forwarding.sh &
 fi
 
-exec su --preserve-environment ${RUN_AS} -s /bin/bash -c "/usr/bin/transmission-daemon --foreground -g ${TRANSMISSION_HOME}"
+exec su --preserve-environment "${RUN_AS}" -s /bin/bash -c "/usr/bin/transmission-daemon --foreground -g ${TRANSMISSION_HOME}"

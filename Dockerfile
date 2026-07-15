@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7
+
 # Helper image to install Transmission UIs
 FROM alpine:latest AS transmissionui
 

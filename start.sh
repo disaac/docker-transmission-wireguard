@@ -380,8 +380,9 @@ configure_docker_name_proxies() {
 
 wireguard_endpoint_host() {
   local endpoint="$1"
-
-  if [[ "$endpoint" =~ ^\[([^]]+)\]:(.+)$ ]]; then
+  local endpoint_re
+  endpoint_re='^\[([^]]+)\]:(.+)$'
+  if [[ "$endpoint" =~ $endpoint_re ]]; then
     echo "${BASH_REMATCH[1]}"
     return
   fi

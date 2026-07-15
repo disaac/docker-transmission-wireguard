@@ -28,6 +28,20 @@ get the PUID/PGID working like it used to. I'll try to clean up that as well.
 If you're already running the old image, I'd recommend setting the ports option to: `- 9092:9091`.
 That way you'll map it to port 9092 locally and you can have them both running at the same time.
 
+### Building with piawgc
+
+This image fetches the private `piawgc` release binary during the Docker build.
+Pass a GitHub token that can read `disaac/piawgc` releases:
+
+```sh
+docker build \
+  --secret id=GH_TOKEN,env=GH_TOKEN \
+  -t transmission-wireguard:piawgc .
+```
+
+The build downloads the latest release asset named
+`piawgc-aarch64-unknown-linux-gnu` and installs it as `/usr/local/bin/piawgc`.
+
 
 ### Example Docker Compose file:
 ```yaml
@@ -53,6 +67,57 @@ services:
       options:
         max-size: 10m
 ```
+
+## PIA WireGuard config regeneration with piawgc
+
+Set `PIA_USE_PIAWGC=true` to have the container generate the configured
+WireGuard file with `piawgc` at launch, then let `piawgc` monitor and recover
+`wg0`.
+
+```yaml
+environment:
+  - PIA_USE_PIAWGC=true
+  - PIA_USERNAME=your-pia-username
+  - PIA_PASSWORD=your-pia-password
+  - CONFIG_FILE=/wg-config/switzerland.conf
+  - PIAWGC_REGION=swiss
+```
+
+`CONFIG_FILE` is the file path to write and later read for `wg0` setup.
+`PIAWGC_REGION` must be the PIA region id, not the config filename. For example,
+`/wg-config/netherlands.conf` should use `PIAWGC_REGION=nl_amsterdam`.
+
+You can also set `PIAWGC_PIA_TOKEN` directly, or use
+`PIAWGC_PIA_USERNAME`/`PIAWGC_PIA_PASSWORD` instead of `PIA_USERNAME` and
+`PIA_PASSWORD`.
+
+When enabled, startup runs a one-shot generation before WireGuard is configured.
+After `wg0` is up, the container starts `piawgc --listen-sig --outfile
+"$CONFIG_FILE"` with `piawgc`'s built-in WireGuard monitor enabled. The utility
+checks the WireGuard interface, regenerates `CONFIG_FILE`, and reloads `wg0`
+itself when recovery is needed.
+
+Monitoring and recovery are controlled by these environment variables:
+
+```yaml
+environment:
+  - PIAWGC_WG_INTERFACE=wg0
+  - PIAWGC_WG_MONITOR_HEALTH_CHECK_INTERVAL_MS=30000
+  - PIAWGC_WG_MONITOR_FAILED_HEALTH_CHECKS=3
+  - PIAWGC_WG_MONITOR_RECOVERY_ATTEMPTS=5
+  - PIAWGC_PIA_STATUS_FILE=/tmp/piawgc-status.json
+  - PIAWGC_PID_FILE=/tmp/piawgc.pid
+  - PIAWGC_STATUS_WAIT_SECONDS=10
+```
+
+The defaults check `wg0` every 30 seconds, wait for 3 failed health checks before
+recovery, and allow 5 recovery attempts before `piawgc` reports the monitor as
+permanently unhealthy.
+
+The image healthcheck reads `PIAWGC_PID_FILE`, sends `SIGUSR1` to the running
+`piawgc` daemon, and parses `PIAWGC_PIA_STATUS_FILE`. The container reports
+unhealthy when the daemon is missing, status JSON cannot be read, the monitor is
+disabled unexpectedly, or `.wireguard_monitor.permanently_unhealthy` is `true`.
 
 ## PIA port forwarding
 

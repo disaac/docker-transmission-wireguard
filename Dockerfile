@@ -33,17 +33,20 @@ VOLUME /config
 
 COPY --from=transmissionui /opt/transmission-ui /opt/transmission-ui
 
-ARG DEBIAN_FRONTEND=noninteractive
 ARG PIAWGC_REPOSITORY=disaac/piawgc
 ARG PIAWGC_ASSET_NAME=piawgc-aarch64-unknown-linux-gnu
 # hadolint ignore=DL3008
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's|http://ports.ubuntu.com/ubuntu-ports/|https://ports.ubuntu.com/ubuntu-ports/|g' /etc/apt/sources.list.d/ubuntu.sources \
+    && printf '%s\n' 'Acquire::https::Verify-Peer "false";' > /etc/apt/apt.conf.d/99bootstrap-no-verify \
+    && DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get update \
+    && DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends \
     dumb-init transmission-daemon python3 dnsmasq-base \
     tzdata dnsutils iputils-ping ufw iproute2 iptables \
     openssh-client git jq curl wget unrar unzip bc ca-certificates \
     # New for this image
     wireguard nginx libnginx-mod-stream privoxy gettext-base \
     # End new for this image
+    && rm -f /etc/apt/apt.conf.d/99bootstrap-no-verify \
     && rm -rf /tmp/* /var/tmp/* /var/lib/apt/lists/* \
     && useradd -u 911 -U -d /config -s /bin/false abc \
     && usermod -G users abc

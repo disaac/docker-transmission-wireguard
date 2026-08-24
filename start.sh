@@ -29,6 +29,21 @@ curl --silent --max-time 15 -w "\n" ipecho.net/plain || echo "Public IP check fa
 
 if ip netns ls | grep -q "physical"
 then
+    # Dangling network from previous run (e.g. `docker restart` reusing the same
+    # network namespace after a crash mid-setup). The container's real interface
+    # (moved into "physical" earlier by this script, see below) would otherwise be
+    # destroyed along with the namespace, permanently killing the container's
+    # networking until Docker recreates it. Move it back to the default namespace
+    # first; wg0/veth* are our own artifacts and are safe to let go.
+    echo "Restoring physical-namespace interfaces to the default namespace before cleanup"
+    for iface in $(ip -n physical -o link show | awk -F': ' '{print $2}' | cut -d@ -f1); do
+      case "$iface" in
+        lo | wg0 | veth*) continue ;;
+      esac
+      echo "Moving $iface back to the default namespace"
+      ip -n physical link set "$iface" netns 1 || true
+    done
+
     # Dangling network from previous run, clean up
     echo "Clean up dangling network namespaces"
     ip -all netns delete || echo "Dangling namespace cleanup reported errors; continuing startup"

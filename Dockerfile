@@ -5,7 +5,7 @@ FROM alpine:3.22 AS transmissionui
 
 SHELL ["/bin/ash", "-o", "pipefail", "-c"]
 # hadolint ignore=DL3018
-RUN apk --no-cache add curl jq \
+RUN apk --no-cache add curl jq unzip \
     && mkdir -p /opt/transmission-ui \
     && echo "Install Shift" \
     && wget -qO- https://github.com/killemov/Shift/archive/master.tar.gz | tar xz -C /opt/transmission-ui \
@@ -18,7 +18,9 @@ RUN apk --no-cache add curl jq \
     && wget -qO- https://github.com/endor/kettu/archive/master.tar.gz | tar xz -C /opt/transmission-ui \
     && mv /opt/transmission-ui/kettu-master /opt/transmission-ui/kettu \
     && echo "Install Transmissionic" \
-    && wget -qO- https://github.com/6c65726f79/Transmissionic/releases/download/v1.8.0/Transmissionic-webui-v1.8.0.zip | unzip -q - \
+    && wget -qO /tmp/transmissionic.zip https://github.com/6c65726f79/Transmissionic/releases/download/v1.8.0/Transmissionic-webui-v1.8.0.zip \
+    && unzip -q /tmp/transmissionic.zip \
+    && rm /tmp/transmissionic.zip \
     && mv web /opt/transmission-ui/transmissionic \
     && echo "Install Transmission Web Control" \
     && wget -qO- https://github.com/ronggang/transmission-web-control/archive/v1.6.1-update1.tar.gz | tar xz -C /opt/transmission-ui \

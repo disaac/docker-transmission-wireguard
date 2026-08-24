@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # Helper image to install Transmission UIs
-FROM alpine:latest AS transmissionui
+FROM alpine:3 AS transmissionui
 
 SHELL ["/bin/ash", "-o", "pipefail", "-c"]
 # hadolint ignore=DL3018

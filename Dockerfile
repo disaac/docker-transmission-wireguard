@@ -74,6 +74,7 @@ RUN --mount=type=secret,id=GH_TOKEN,required=true \
 
 COPY start.sh /opt/wireguard/start.sh
 COPY get-config-value.py /opt/wireguard/get-config-value.py
+COPY resolve-wg-endpoints.py /opt/wireguard/resolve-wg-endpoints.py
 COPY strip-wg-config.py /opt/wireguard/strip-wg-config.py
 COPY pia-port-forwarding.sh /opt/wireguard/pia-port-forwarding.sh
 COPY healthcheck.sh /opt/wireguard/healthcheck.sh

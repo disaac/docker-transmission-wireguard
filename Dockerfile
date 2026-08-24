@@ -35,7 +35,9 @@ RUN apt-get update && apt-get install -y \
     dumb-init python3 \
     tzdata dnsutils iputils-ping ufw iproute2 \
     openssh-client git jq curl wget unrar unzip bc \
-    wireguard nginx \
+    # New for this image
+    wireguard nginx libnginx-mod-stream privoxy gettext-base \
+    # End new for this image
     && rm -rf /tmp/* /var/tmp/* /var/lib/apt/lists/* \
     && useradd -u 911 -U -d /config -s /bin/false abc \
     && usermod -G users abc
@@ -43,9 +45,10 @@ RUN apt-get update && apt-get install -y \
 
 ADD start.sh /opt/wireguard/start.sh
 ADD get-config-value.py /opt/wireguard/get-config-value.py
-ADD resolve-wg-endpoints.py /opt/wireguard/resolve-wg-endpoints.py
 ADD strip-wg-config.py /opt/wireguard/strip-wg-config.py
 ADD nginx_server.conf /opt/nginx/server.conf
+ADD nginx_templates /opt/nginx/templates
+RUN mkdir -p /opt/nginx/main.d /opt/nginx/stream.d
 ADD transmission-default-settings.json /opt/transmission/default-settings.json
 ADD updateSettings.py /opt/transmission/
 ADD userSetup.sh /opt/transmission/
@@ -56,10 +59,18 @@ ENV TRANSMISSION_HOME=/config/transmission-home \
     TRANSMISSION_INCOMPLETE_DIR=/data/incomplete \
     TRANSMISSION_WATCH_DIR=/data/watch \
     GLOBAL_APPLY_PERMISSIONS=true \
-    TRANSMISSION_UMASK=2
+    TRANSMISSION_UMASK=2 \
+    WEBPROXY_ENABLED=false \
+    WEBPROXY_PORT=8118 \
+    WEBPROXY_BIND_ADDRESS=
 
 # Get base_revision passed as a build argument and set it as env var
 ARG REVISION
 ENV REVISION=${REVISION:-""}
+
+# Transmission RPC
+EXPOSE 9091
+# Privoxy web proxy
+EXPOSE 8118
 
 CMD ["dumb-init", "/opt/wireguard/start.sh"]

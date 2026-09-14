@@ -65,12 +65,6 @@ echo "Interface broadcast: $INT_BRD"
 DOCKER_DNS_SERVER="${DOCKER_DNS_SERVER:-$(awk '/^nameserver[[:space:]]+127\.0\.0\.11$/ { print $2; exit }' /etc/resolv.conf)}"
 DOCKER_DNS_SERVER="${DOCKER_DNS_SERVER:-127.0.0.11}"
 
-# Resolve WireGuard Endpoint hostnames to IPs while eth0 is still in this namespace
-# (uses dig @WG_BOOTSTRAP_DNS, default 1.1.1.1 — not Docker's 127.0.0.11).
-RESOLVED_CONFIG="$(mktemp)"
-trap 'rm -f "$RESOLVED_CONFIG"' EXIT
-python3 /opt/wireguard/resolve-wg-endpoints.py "$CONFIG_FILE" "$RESOLVED_CONFIG"
-
 # Override DNS to Cloudflare unless ACCEPT_DNS_PRIVACY_LOSS is set to true (case insensitive).
 # If set, Docker's resolver (often 127.0.0.11) may bypass the WireGuard tunnel for DNS.
 if [ -z "${ACCEPT_DNS_PRIVACY_LOSS}" ] || ! [[ "${ACCEPT_DNS_PRIVACY_LOSS,,}" == "true" ]]; then
@@ -198,6 +192,19 @@ start_piawgc_daemon() {
 
 configure_piawgc_environment
 piawgc_generate_initial_config
+
+# Resolve WireGuard Endpoint hostnames to IPs while eth0 is still in this namespace
+# (uses dig @WG_BOOTSTRAP_DNS, default 1.1.1.1 — not Docker's 127.0.0.11). Must run after
+# piawgc_generate_initial_config: when PIA_USE_PIAWGC is set, piawgc overwrites
+# CONFIG_FILE with a freshly-registered peer here, replacing whatever was left over from
+# a previous session on the /wg-config bind mount. Resolving any earlier would silently
+# carry that stale peer/address forward into RESOLVED_CONFIG (used below to actually
+# configure wg0), producing a "connected" tunnel to a peer PIA never associated with this
+# session's key - handshake never completes, zero bytes ever received, and every check
+# that depends on the tunnel (health, DNS, port forwarding) fails no matter the region.
+RESOLVED_CONFIG="$(mktemp)"
+trap 'rm -f "$RESOLVED_CONFIG"' EXIT
+python3 /opt/wireguard/resolve-wg-endpoints.py "$CONFIG_FILE" "$RESOLVED_CONFIG"
 
 # Create a "physical" network namespace and move our eth0 there
 ip netns ls
